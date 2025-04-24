@@ -71,8 +71,8 @@ echo "2) 7.0"
 read -p "Enter choice (1 or 2): " version_choice
 
 case $version_choice in
-    1) MONGO_VERSION="mongodb-linux-x86_64-rhel80-6.0.0.tgz";;
-    2) MONGO_VERSION="mongodb-linux-x86_64-rhel80-7.0.0.tgz";;
+    1) MONGO_VERSION="mongodb-linux-x86_64-rhel90-6.0.22.tgz";;
+    2) MONGO_VERSION="mongodb-linux-x86_64-rhel90-7.0.19.tgz";;
     *) echo -e "${RED}Invalid choice. Exiting.${RESET}"; exit 1;;
 esac
 
@@ -88,9 +88,9 @@ tar -zxvf "$MONGO_VERSION" -C "$MONGODB_DIR"  # Extract directly to the MongoDB 
 
 # Correctly identify the extracted folder
 if [[ $version_choice == 1 ]]; then
-    EXTRACTED_DIR="mongodb-linux-x86_64-rhel80-6.0.0"
+    EXTRACTED_DIR="mongodb-linux-x86_64-rhel90-6.0.22"
 elif [[ $version_choice == 2 ]]; then
-    EXTRACTED_DIR="mongodb-linux-x86_64-rhel80-7.0.0"
+    EXTRACTED_DIR="mongodb-linux-x86_64-rhel90-7.0.19"
 fi
 
 # Create the symlink to the extracted directory
@@ -129,8 +129,6 @@ systemLog:
     logAppend: true
 storage:
     dbPath: "$MONGODB_DIR/db/"
-    journal:
-        enabled: true
     directoryPerDB: true
     engine: wiredTiger
     wiredTiger:
