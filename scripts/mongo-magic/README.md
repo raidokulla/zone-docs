@@ -6,8 +6,11 @@ Mongo Magic is a bash script designed to automate the installation and setup of 
 ## Features
 - Detects the server's OS and architecture and cross-checks it against MongoDB's
   official release catalog (`downloads.mongodb.org`) to pick the exact right
-  binary, rather than guessing a filename. If it can't be sure, it aborts
-  instead of installing the wrong binary.
+  binary, rather than guessing a filename. When the OS isn't one MongoDB
+  publishes a build for (e.g. Zone.eu's own ZoneOS, which has no rpm/dpkg
+  and no equivalent in MongoDB's catalog), it probes a short list of
+  known-compatible builds and verifies each one by actually running `mongod`,
+  rather than trusting a name match. It only aborts if nothing it tries runs.
 - Verifies the SHA-256 checksum of every downloaded artifact.
 - Only ever installs the free Community edition (never the commercial Enterprise
   build, even though both are listed side by side in MongoDB's feeds).
@@ -27,9 +30,14 @@ Mongo Magic is a bash script designed to automate the installation and setup of 
 
 ## Supported platforms
 The script auto-detects RHEL-family (RHEL, CentOS, Rocky, AlmaLinux), Debian,
-Ubuntu, Amazon Linux, and SUSE hosts on x86_64/aarch64. If your server isn't on
-this list, or MongoDB doesn't publish a matching build, the script stops and
-points you to the [MongoDB Download Center](https://www.mongodb.com/try/download/community-edition)
+Ubuntu, Amazon Linux, and SUSE hosts on x86_64/aarch64. On hosts it can't
+confidently name -- notably Zone.eu's own ZoneOS, a Gentoo/ChromiumOS-derived
+image with no package manager at all -- it instead tries a short list of
+known-compatible builds (RHEL 9/8, Ubuntu 24.04/22.04, Debian 12/11, Amazon
+Linux 2023) and keeps whichever one actually runs `mongod` successfully. If
+none of them run, or MongoDB doesn't publish a matching build for the
+architecture, the script stops and points you to the
+[MongoDB Download Center](https://www.mongodb.com/try/download/community-edition)
 instead of guessing.
 
 ## Installation

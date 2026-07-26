@@ -14,7 +14,10 @@
 # Features:
 # - Detects the server's OS/architecture and asks MongoDB's official release
 #   catalog (downloads.mongodb.org) which binary actually matches it, instead
-#   of guessing a filename. Aborts instead of installing the wrong binary.
+#   of guessing a filename. When the OS isn't one MongoDB publishes a build
+#   for (e.g. Zone.eu's own ZoneOS), it probes a list of known-compatible
+#   builds and verifies each one by actually running mongod, rather than
+#   trusting a name match. Aborts only if nothing it tries will run.
 # - Verifies the SHA-256 checksum of every downloaded artifact.
 # - Lets you choose between MongoDB 8.0 (current Long-Term/Major Release,
 #   recommended) and 7.0 (previous Major Release, still supported).
@@ -160,6 +163,14 @@ detect_os_key() {
     local major="${version%%.*}"
 
     case "$id" in
+        zoneos)
+            # Zone.eu's own ZoneOS host image: a Gentoo/ChromiumOS-derived,
+            # rpm/dpkg-less system (see ZONEOS_BOARD in /etc/os-release) that
+            # has no equivalent target in MongoDB's release catalog. Don't
+            # guess one here -- leave OS_KEY empty and let the FALLBACK_TARGETS
+            # probe below find a build that actually runs, verified by
+            # execution rather than by name.
+            echo "" ;;
         rhel|centos|rocky|almalinux|ol|fedora)
             echo "rhel${major}" ;;
         ubuntu)
@@ -194,12 +205,35 @@ detect_arch() {
 OS_KEY=$(detect_os_key)
 ARCH=$(detect_arch)
 
-if [ -z "$OS_KEY" ] || [ -z "$ARCH" ]; then
-    error "Could not confidently detect this server's OS/architecture."
+if [ -z "$ARCH" ]; then
+    error "Could not detect this server's CPU architecture (uname -m: $(uname -m))."
     error "Please check https://www.mongodb.com/try/download/community-edition and install manually."
     exit 1
 fi
-info "Detected platform: ${OS_KEY} / ${ARCH}"
+
+# Targets to try, in order, against MongoDB's release catalog. The detected
+# OS_KEY (if any) is always tried first; the rest are a fallback list for
+# hosts we can't confidently name -- e.g. Zone.eu's own ZoneOS, which isn't
+# a distro MongoDB has ever heard of. Every candidate is downloaded and
+# smoke-tested with `mongod --version` before being trusted (see below), so
+# a wrong guess here just moves on to the next one instead of silently
+# installing a binary that can't run.
+FALLBACK_TARGETS=(rhel9 ubuntu2404 debian12 amazon2023 ubuntu2204 rhel8 debian11)
+
+CANDIDATES=()
+[ -n "$OS_KEY" ] && CANDIDATES+=("$OS_KEY")
+for t in "${FALLBACK_TARGETS[@]}"; do
+    [ "$t" != "$OS_KEY" ] && CANDIDATES+=("$t")
+done
+
+if [ -n "$OS_KEY" ]; then
+    info "Detected platform: ${OS_KEY} / ${ARCH}"
+else
+    OS_NAME=""
+    [ -r /etc/os-release ] && OS_NAME=$(. /etc/os-release; echo "${PRETTY_NAME:-$ID}")
+    warn "Could not map this server's OS${OS_NAME:+ ($OS_NAME)} to a MongoDB release-catalog target directly."
+    warn "Will probe known-compatible builds (${CANDIDATES[*]}) and use whichever one actually runs here."
+fi
 
 # mongosh's feed labels ARM as "arm64" instead of "aarch64"
 MONGOSH_ARCH="$ARCH"
@@ -291,37 +325,53 @@ esac
 # ---------------------------------------------------------------------------
 # RESOLVE & DOWNLOAD MONGODB SERVER
 # ---------------------------------------------------------------------------
-info "Looking up the correct MongoDB ${MONGO_BRANCH} build for this server..."
+info "Looking up a MongoDB ${MONGO_BRANCH} build for this server..."
 SERVER_FEED="$SCRATCH_DIR/current.json"
 download "https://downloads.mongodb.org/current.json" "$SERVER_FEED"
-
-if ! RESULT=$(resolve_download "$SERVER_FEED" "$ARCH" target "$OS_KEY" "" "$MONGO_BRANCH" targeted); then
-    error "Could not find a MongoDB ${MONGO_BRANCH} build for ${OS_KEY}/${ARCH} in MongoDB's release catalog."
-    error "Please check https://www.mongodb.com/try/download/community-edition and install manually."
-    exit 1
-fi
-IFS=$'\t' read -r MONGO_VERSION MONGO_URL MONGO_SHA256 <<< "$RESULT"
-info "Resolved MongoDB ${MONGO_VERSION} (${MONGO_URL})"
 
 # CREATE REQUIRED DIRS
 mkdir -p "$MONGODB_DIR/log" "$MONGODB_DIR/run" "$MONGODB_DIR/db" "$MONGODB_DIR/mongosh" "$MONGODB_DIR/tools"
 cd "$MONGODB_DIR" || { error "Failed to change directory!"; exit 1; }
 
-MONGO_ARCHIVE="$SCRATCH_DIR/$(basename "$MONGO_URL")"
-download "$MONGO_URL" "$MONGO_ARCHIVE"
-verify_checksum "$MONGO_ARCHIVE" "$MONGO_SHA256"
-tar -zxf "$MONGO_ARCHIVE" -C "$MONGODB_DIR"
+MONGO_VERSION="" MONGO_TARGET=""
+for candidate in "${CANDIDATES[@]}"; do
+    if ! RESULT=$(resolve_download "$SERVER_FEED" "$ARCH" target "$candidate" "" "$MONGO_BRANCH" targeted); then
+        continue
+    fi
+    IFS=$'\t' read -r c_version c_url c_sha256 <<< "$RESULT"
 
-set +o pipefail
-EXTRACTED_DIR=$(tar -tzf "$MONGO_ARCHIVE" | head -n 1 | cut -d/ -f1)
-set -o pipefail
-ln -sfn "$MONGODB_DIR/$EXTRACTED_DIR" "$MONGODB_DIR/mongodb-binary"
+    info "Trying MongoDB ${c_version} ('${candidate}' build)..."
+    c_archive="$SCRATCH_DIR/$(basename "$c_url")"
+    download "$c_url" "$c_archive"
+    verify_checksum "$c_archive" "$c_sha256"
 
-if ! "$MONGODB_DIR/mongodb-binary/bin/mongod" --version > /dev/null 2>&1; then
-    error "The downloaded mongod binary failed to run on this system (missing shared libraries?)."
+    set +o pipefail
+    c_dir=$(tar -tzf "$c_archive" | head -n 1 | cut -d/ -f1)
+    set -o pipefail
+    rm -rf "$SCRATCH_DIR/probe"
+    mkdir -p "$SCRATCH_DIR/probe"
+    tar -zxf "$c_archive" -C "$SCRATCH_DIR/probe"
+
+    if "$SCRATCH_DIR/probe/$c_dir/bin/mongod" --version > /dev/null 2>&1; then
+        rm -rf "$MONGODB_DIR/$c_dir"
+        mv "$SCRATCH_DIR/probe/$c_dir" "$MONGODB_DIR/$c_dir"
+        ln -sfn "$MONGODB_DIR/$c_dir" "$MONGODB_DIR/mongodb-binary"
+        MONGO_VERSION="$c_version"
+        MONGO_TARGET="$candidate"
+        rm -f "$c_archive"
+        info "MongoDB ${MONGO_VERSION} ('${candidate}' build) downloaded, verified, and confirmed runnable."
+        break
+    fi
+
+    warn "'${candidate}' build downloaded but mongod couldn't run here (likely missing shared libraries); trying next candidate."
+    rm -rf "$SCRATCH_DIR/probe" "$c_archive"
+done
+
+if [ -z "$MONGO_VERSION" ]; then
+    error "None of the candidate MongoDB ${MONGO_BRANCH} builds (${CANDIDATES[*]}) would run on this server."
+    error "Please check https://www.mongodb.com/try/download/community-edition and install manually."
     exit 1
 fi
-info "MongoDB ${MONGO_VERSION} downloaded and verified."
 
 # ---------------------------------------------------------------------------
 # RESOLVE & DOWNLOAD MONGOSH
@@ -349,15 +399,34 @@ info "Fetching the latest MongoDB Database Tools build..."
 TOOLS_FEED="$SCRATCH_DIR/tools-release.json"
 download "https://downloads.mongodb.org/tools/db/release.json" "$TOOLS_FEED"
 
-if RESULT=$(resolve_download "$TOOLS_FEED" "$ARCH" name "$OS_KEY" "" "" ""); then
-    IFS=$'\t' read -r TOOLS_VERSION TOOLS_URL TOOLS_SHA256 <<< "$RESULT"
-    TOOLS_ARCHIVE="$SCRATCH_DIR/tools.tgz"
-    download "$TOOLS_URL" "$TOOLS_ARCHIVE"
-    verify_checksum "$TOOLS_ARCHIVE" "$TOOLS_SHA256"
-    tar -zxf "$TOOLS_ARCHIVE" -C "$MONGODB_DIR/tools" --strip-components=1
-    info "MongoDB Database Tools ${TOOLS_VERSION} installed."
-else
-    warn "Could not find a matching MongoDB Database Tools build for ${OS_KEY}/${ARCH}. Skipping (optional)."
+TOOLS_VERSION=""
+for candidate in "${CANDIDATES[@]}"; do
+    if ! RESULT=$(resolve_download "$TOOLS_FEED" "$ARCH" name "$candidate" "" "" ""); then
+        continue
+    fi
+    IFS=$'\t' read -r c_version c_url c_sha256 <<< "$RESULT"
+    c_archive="$SCRATCH_DIR/tools.tgz"
+    download "$c_url" "$c_archive"
+    verify_checksum "$c_archive" "$c_sha256"
+
+    rm -rf "$MONGODB_DIR/tools"
+    mkdir -p "$MONGODB_DIR/tools"
+    tar -zxf "$c_archive" -C "$MONGODB_DIR/tools" --strip-components=1
+    rm -f "$c_archive"
+
+    if "$MONGODB_DIR/tools/bin/mongodump" --version > /dev/null 2>&1; then
+        TOOLS_VERSION="$c_version"
+        info "MongoDB Database Tools ${TOOLS_VERSION} ('${candidate}' build) installed and confirmed runnable."
+        break
+    fi
+
+    warn "Database Tools '${candidate}' build couldn't run here; trying next candidate."
+    rm -rf "$MONGODB_DIR/tools"
+done
+
+if [ -z "$TOOLS_VERSION" ]; then
+    warn "Could not find a working MongoDB Database Tools build for this server. Skipping (optional)."
+    mkdir -p "$MONGODB_DIR/tools"
 fi
 
 # ---------------------------------------------------------------------------
@@ -532,6 +601,7 @@ fi
 # WRAP UP
 # ---------------------------------------------------------------------------
 info "MongoDB installation completed successfully."
+echo "MongoDB version: $MONGO_VERSION (using the '${MONGO_TARGET}' build)"
 sleep 1
 warn "IMPORTANT: Setup MongoDB as new PM2 app at Zone.eu"
 echo "Webhosting -> PM2 and Node.js -> Add new application"
